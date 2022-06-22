@@ -48,16 +48,20 @@ func setTerraformVariables(t *testing.T) map[string]string {
 // https://docs.microsoft.com/en-us/azure/developer/go/azure-sdk-authentication?tabs=bash
 func setARMVariables(t *testing.T) {
 
-	// Set environment variables for Azure SDK authentication
-	os.Setenv("AZURE_CLIENT_ID", os.Getenv("spnClientId"))
-	os.Setenv("AZURE_CLIENT_SECRET", os.Getenv("spnClientSecret"))
-	os.Setenv("AZURE_TENANT_ID", os.Getenv("spnTenantId"))
-	os.Setenv("AZURE_SUBSCRIPTION_ID", os.Getenv("subscriptionId"))
-
-	// If any of the above variables are empty, return an error
-	if os.Getenv("AZURE_CLIENT_ID") == "" || os.Getenv("AZURE_CLIENT_SECRET") == "" || os.Getenv("AZURE_TENANT_ID") == "" || os.Getenv("AZURE_SUBSCRIPTION_ID") == "" {
+	// If any of the required variables are empty, return an error
+	if os.Getenv("spnClientId") == "" || os.Getenv("spnClientSecret") == "" || os.Getenv("spnTenantId") == "" || os.Getenv("subscriptionId") == "" {
 		t.Fatalf("Missing one or more of the following environment variables: spnClientId, spnClientSecret, spnTenantId, subscriptionId")
 	}
+
+	// Set environment variables for Azure SDK authentication - both permutations
+	os.Setenv("AZURE_CLIENT_ID", os.Getenv("spnClientId"))
+	os.Setenv("ARM_CLIENT_ID", os.Getenv("spnClientId"))
+	os.Setenv("AZURE_CLIENT_SECRET", os.Getenv("spnClientSecret"))
+	os.Setenv("ARM_CLIENT_SECRET", os.Getenv("spnClientSecret"))
+	os.Setenv("AZURE_TENANT_ID", os.Getenv("spnTenantId"))
+	os.Setenv("ARM_TENANT_ID", os.Getenv("spnTenantId"))
+	os.Setenv("AZURE_SUBSCRIPTION_ID", os.Getenv("subscriptionId"))
+	os.Setenv("ARM_SUBSCRIPTION_ID", os.Getenv("subscriptionId"))
 
 }
 

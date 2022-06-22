@@ -27,35 +27,40 @@ Run all the test modules:
 go test -v -timeout 90m
 ```
 
-Run one specific modules and all test cases within it:
+Run two specific modules and all test cases within it - can run in parallel since the AKS modules have identical input requirements, and the paths used by the tests will be unique:
 
 ```bash
-go test -v -timeout 90m -run 'TestAksRbacYesExampleWithStages'
+# RBAC: Yes
+go test -timeout 30m -run 'TestAksRbacExampleWithStages' -args -aksRbacExampleGitDir="../examples/aks-rbac-yes"
+
+# RBAC: No
+go test -timeout 30m -run 'TestAksRbacExampleWithStages' -args -aksRbacExampleGitDir="../examples/aks-rbac-no"
 ```
 
 ## Development workflow via `Stages`
 
 Example:
 ```bash
-# Blow away old local state
-rm -rf /workspaces/terraform-infrastructure-modules/examples/aks-rbac-yes/.terraform
-rm -rf /workspaces/terraform-infrastructure-modules/examples/aks-rbac-yes/.test-data
-rm -rf /workspaces/terraform-infrastructure-modules/examples/aks-rbac-yes/.terraform.lock.hcl
+# Blow away old local state (for yes and no)
+MODULE='aks-rbac-no'
+rm -rf /workspaces/terraform-infrastructure-modules/examples/${MODULE}/.terraform
+rm -rf /workspaces/terraform-infrastructure-modules/examples/${MODULE}/.test-data
+rm -rf /workspaces/terraform-infrastructure-modules/examples/${MODULE}/.terraform.lock.hcl
 
 # 1. Deploy one-time
-SKIP_teardown_aksRbacYes=true \
-SKIP_validate_aksRbacYes=true \
-go test -timeout 30m -run 'TestAksRbacYesExampleWithStages'
+SKIP_teardown_aksRbac=true \
+SKIP_validate_aksRbac=true \
+go test -timeout 30m -run 'TestAksRbacExampleWithStages' -args -aksRbacExampleGitDir="../examples/aks-rbac-yes"
 # ...
 
 # 2. Iterate on validation
-SKIP_teardown_aksRbacYes=true \
-SKIP_deploy_aksRbacYes=true \
-go test -timeout 30m -run 'TestAksRbacYesExampleWithStages'
+SKIP_teardown_aksRbac=true \
+SKIP_deploy_aksRbac=true \
+go test -timeout 30m -run 'TestAksRbacExampleWithStages' -args -aksRbacExampleGitDir="../examples/aks-rbac-yes"
 # PASS
 # ok      github.com/kangarookube/terraform-infrastructure-modules        97.323s
 
 # 3. Destroy
-SKIP_deploy_aksRbacYes=true \
-go test -timeout 30m -run 'TestAksRbacYesExampleWithStages'
+SKIP_deploy_aksRbac=true \
+go test -timeout 30m -run 'TestAksRbacExampleWithStages' -args -aksRbacExampleGitDir="../examples/aks-rbac-yes"
 ```

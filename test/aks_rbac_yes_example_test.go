@@ -4,6 +4,7 @@ import (
 	// Native
 
 	"crypto/tls"
+	"flag"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -23,43 +24,46 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var aksRbacExampleGitDir = flag.String("aksRbacExampleGitDir", "", "relative directory of package containing AKS Terraform Module")
+
 const (
-	aksRbacYesExampleGitDir = "../examples/aks-rbac-yes"
-	k8sPayloadSampleDir     = "../examples/kustomize/overlays/loadbalancer"
-	k8sPayloadTempDir       = "../examples/kustomize/.temp"
+	k8sPayloadSampleDir = "../examples/kustomize/overlays/loadbalancer"
+	k8sPayloadTempDir   = "../examples/kustomize/.temp"
 )
 
 // Test run that has skippable stages built in
-func TestAksRbacYesExampleWithStages(t *testing.T) {
+func TestAksRbacExampleWithStages(t *testing.T) {
 	t.Parallel()
 
 	// Defer destruction
-	defer test_structure.RunTestStage(t, "teardown_aksRbacYes", func() {
-		aksRbacYesOpts := test_structure.LoadTerraformOptions(t, aksRbacYesExampleGitDir)
-		defer terraform.Destroy(t, aksRbacYesOpts)
+	defer test_structure.RunTestStage(t, "teardown_aksRbac", func() {
+		aksRbacOpts := test_structure.LoadTerraformOptions(t, *aksRbacExampleGitDir)
+		defer terraform.Destroy(t, aksRbacOpts)
 	})
 
 	// Deploy
-	test_structure.RunTestStage(t, "deploy_aksRbacYes", func() {
-		aksRbacYesOpts := createAksRbacYesOpts(t, aksRbacYesExampleGitDir)
+	test_structure.RunTestStage(t, "deploy_aksRbac", func() {
+		aksRbacOpts := createAksRbacOpts(t, *aksRbacExampleGitDir)
 
 		// Save data to disk so that other test stages executed at a later time can read the data back in
-		test_structure.SaveTerraformOptions(t, aksRbacYesExampleGitDir, aksRbacYesOpts)
+		test_structure.SaveTerraformOptions(t, *aksRbacExampleGitDir, aksRbacOpts)
 
-		terraform.InitAndApply(t, aksRbacYesOpts)
+		terraform.InitAndApply(t, aksRbacOpts)
 	})
 
 	// Test
-	test_structure.RunTestStage(t, "validate_aksRbacYes", func() {
-		aksRbacYesOpts := test_structure.LoadTerraformOptions(t, aksRbacYesExampleGitDir)
+	test_structure.RunTestStage(t, "validate_aksRbac", func() {
+		// Set environment variables for ARM authentication
+		setARMVariables(t)
+		aksRbacOpts := test_structure.LoadTerraformOptions(t, *aksRbacExampleGitDir)
 
-		validateNodeCountWithARM(t, aksRbacYesOpts)
-		validateLoadBalancerReachableWithK8s(t, aksRbacYesOpts)
+		validateNodeCountWithARM(t, aksRbacOpts)
+		validateLoadBalancerReachableWithK8s(t, aksRbacOpts)
 	})
 }
 
 // Creates Terraform Options for with remote state backend
-func createAksRbacYesOpts(t *testing.T, terraformDir string) *terraform.Options {
+func createAksRbacOpts(t *testing.T, terraformDir string) *terraform.Options {
 	uniqueId := strings.ToLower(random.UniqueId())
 
 	// State backend environment variables
@@ -100,8 +104,8 @@ func createAksRbacYesOpts(t *testing.T, terraformDir string) *terraform.Options 
 }
 
 // Validate that the Node Count is g.t zero (since module hard codes it)
-func validateNodeCountWithARM(t *testing.T, aksRbacYesOpts *terraform.Options) {
-	inputResourcePrefix := aksRbacYesOpts.Vars["resource_prefix"].(string)
+func validateNodeCountWithARM(t *testing.T, aksRbacOpts *terraform.Options) {
+	inputResourcePrefix := aksRbacOpts.Vars["resource_prefix"].(string)
 	expectedResourceGroupName := fmt.Sprintf("%s%s", inputResourcePrefix, "rg")
 	expectedClusterName := fmt.Sprintf("%s%s", inputResourcePrefix, "aks")
 
@@ -117,7 +121,7 @@ func validateNodeCountWithARM(t *testing.T, aksRbacYesOpts *terraform.Options) {
 }
 
 // Validate that the service is of type LoadBalancer, and that the deployment webpage is reachable
-func validateLoadBalancerReachableWithK8s(t *testing.T, aksRbacYesOpts *terraform.Options) {
+func validateLoadBalancerReachableWithK8s(t *testing.T, aksRbacOpts *terraform.Options) {
 	// Get absolute paths to the Kustomize directory and the temporary staging directory
 	kustomizePath, err := filepath.Abs(k8sPayloadSampleDir)
 	require.NoError(t, err)
@@ -126,7 +130,7 @@ func validateLoadBalancerReachableWithK8s(t *testing.T, aksRbacYesOpts *terrafor
 
 	// Setup the kubectl config and context - grabbed from Terraform module output
 	namespaceName := strings.ToLower(random.UniqueId())
-	options := k8s.NewKubectlOptions("", fmt.Sprintf("%s/kubeconfig", aksRbacYesExampleGitDir), namespaceName)
+	options := k8s.NewKubectlOptions("", fmt.Sprintf("%s/kubeconfig", *aksRbacExampleGitDir), namespaceName)
 
 	// Generate Kustomized manifest
 	tempKustomizedManifestPath := generateKustomizedManifest(t, kustomizePath, payloadPath)
