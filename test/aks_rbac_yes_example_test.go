@@ -3,13 +3,16 @@ package test
 import (
 	// Native
 
+	"crypto/tls"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	// Terragrunt
 	"github.com/gruntwork-io/terratest/modules/azure"
+	http_helper "github.com/gruntwork-io/terratest/modules/http-helper"
 	"github.com/gruntwork-io/terratest/modules/k8s"
 	"github.com/gruntwork-io/terratest/modules/random"
 	"github.com/gruntwork-io/terratest/modules/terraform"
@@ -23,7 +26,7 @@ import (
 const (
 	aksRbacYesExampleGitDir = "../examples/aks-rbac-yes"
 	k8sPayloadSampleDir     = "../examples/kustomize/overlays/loadbalancer"
-	k8sPayloadTempDir       = "../examples/kustomize/temp"
+	k8sPayloadTempDir       = "../examples/kustomize/.temp"
 )
 
 // Test run that has skippable stages built in
@@ -113,8 +116,9 @@ func validateNodeCountWithARM(t *testing.T, aksRbacYesOpts *terraform.Options) {
 	})
 }
 
+// Validate that the service is of type LoadBalancer, and that the deployment webpage is reachable
 func validateLoadBalancerReachableWithK8s(t *testing.T, aksRbacYesOpts *terraform.Options) {
-	// Get absolute paths to the Kustomize directory and the staging directory
+	// Get absolute paths to the Kustomize directory and the temporary staging directory
 	kustomizePath, err := filepath.Abs(k8sPayloadSampleDir)
 	require.NoError(t, err)
 	payloadPath, err := filepath.Abs(k8sPayloadTempDir)
@@ -127,17 +131,39 @@ func validateLoadBalancerReachableWithK8s(t *testing.T, aksRbacYesOpts *terrafor
 	// Generate Kustomized manifest
 	tempKustomizedManifestPath := generateKustomizedManifest(t, kustomizePath, payloadPath)
 
-	// Clean up
+	// Clean up - note that defer is LIFO - so we have to delete the manifest folder last
+	// Resources > Namespace, Folder
+	defer deleteDir(t, tempKustomizedManifestPath)
 	defer k8s.DeleteNamespace(t, options, namespaceName)
 	defer k8s.KubectlDelete(t, options, tempKustomizedManifestPath)
-	defer deleteDir(t, tempKustomizedManifestPath)
 
-	// Create resources
+	// Create namespace scoped resources
 	k8s.CreateNamespace(t, options, namespaceName)
 	k8s.KubectlApply(t, options, tempKustomizedManifestPath)
 
-	// Test type LoadBalancer
+	// Test the service type is LoadBalancer
+	// This will wait up to 200 seconds for the service to become available, to ensure that we can access it
+	k8s.WaitUntilServiceAvailable(t, options, "nginx-service", 10, 20*time.Second)
+	service := k8s.GetService(t, options, "nginx-service")
+	serviceType := string(service.Spec.Type)
 
-	// Test reachable
+	t.Run("service_is_LoadBalancer", func(t *testing.T) {
+		assert.Equal(t, strings.ToLower("LoadBalancer"), strings.ToLower(serviceType), "Ensure Service is of type LoadBalancer as declared")
+	})
 
+	// Test that the nginx deployment is reachable over the web
+	// Setup a TLS configuration to submit with the helper, a blank struct is acceptable
+	tlsConfig := tls.Config{}
+
+	// Test the endpoint for up to 5 minutes. This will only fail if we timeout waiting for the service to return a 200 response.
+	http_helper.HttpGetWithRetryWithCustomValidation(
+		t,
+		fmt.Sprintf("http://%s", k8s.GetServiceEndpoint(t, options, service, 80)),
+		&tlsConfig,
+		30,
+		10*time.Second,
+		func(statusCode int, body string) bool {
+			return statusCode == 200
+		},
+	)
 }

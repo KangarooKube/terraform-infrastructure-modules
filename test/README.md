@@ -52,5 +52,10 @@ go test -timeout 30m -run 'TestAksRbacYesExampleWithStages'
 SKIP_teardown_aksRbacYes=true \
 SKIP_deploy_aksRbacYes=true \
 go test -timeout 30m -run 'TestAksRbacYesExampleWithStages'
-# ...
+# PASS
+# ok      github.com/kangarookube/terraform-infrastructure-modules        97.323s
+
+# 3. Destroy
+SKIP_deploy_aksRbacYes=true \
+go test -timeout 30m -run 'TestAksRbacYesExampleWithStages'
 ```
