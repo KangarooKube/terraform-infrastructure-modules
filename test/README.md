@@ -42,7 +42,7 @@ go test -timeout 30m -run 'TestAksRbacExampleWithStages' -args -aksRbacExampleGi
 Example:
 ```bash
 # Blow away old local state (for yes and no)
-MODULE='aks-rbac-no'
+MODULE='aks-rbac-yes'
 rm -rf /workspaces/terraform-infrastructure-modules/examples/${MODULE}/.terraform
 rm -rf /workspaces/terraform-infrastructure-modules/examples/${MODULE}/.test-data
 rm -rf /workspaces/terraform-infrastructure-modules/examples/${MODULE}/.terraform.lock.hcl
