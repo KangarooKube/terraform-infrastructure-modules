@@ -76,6 +76,19 @@ if ! id "$RUNNER_USER" >/dev/null 2>&1; then
 fi
 usermod -aG docker "$RUNNER_USER"
 
+SUDOERS_FILE="/etc/sudoers.d/90-${RUNNER_USER}-nopasswd"
+SUDOERS_TMP="$(mktemp)"
+printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$RUNNER_USER" > "$SUDOERS_TMP"
+if visudo -c -f "$SUDOERS_TMP" >/dev/null; then
+  install -m 0440 -o root -g root "$SUDOERS_TMP" "$SUDOERS_FILE"
+  echo "Installed passwordless sudo at $SUDOERS_FILE"
+else
+  echo "ERROR: visudo refused generated sudoers fragment for $RUNNER_USER" >&2
+  rm -f "$SUDOERS_TMP"
+  exit 1
+fi
+rm -f "$SUDOERS_TMP"
+
 # ----- GitHub Actions runner -------------------------------------------------
 RUNNER_HOME="/home/${RUNNER_USER}/actions-runner"
 RUNNER_TARBALL="actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
