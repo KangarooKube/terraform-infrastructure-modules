@@ -7,9 +7,11 @@ Fairly matured Terraform modules that are used for automated testing throughout 
 ├── examples                            # Example modules that are ready to call
 │   ├── aks-rbac-no
 │   ├── aks-rbac-yes
+│   ├── github-runner-azure-vmss        # Self-hosted GitHub Actions runner on Azure VMSS + Bastion
 │   └── kustomize                       # Sample Nginx deployment with LoadBalancer for automated tests
 ├── LICENSE
 ├── modules                             # Core modules
+│   ├── github-runner                   # Self-hosted GitHub Actions runners
 │   ├── kubernetes
 │   ├── misc
 │   └── monitoring

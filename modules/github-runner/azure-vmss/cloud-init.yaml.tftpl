@@ -1,0 +1,43 @@
+#cloud-config
+write_files:
+  - path: /opt/gh-runner/runner.env
+    permissions: "0600"
+    owner: root:root
+    content: |
+      GH_REPO=${github_repo}
+      GH_RUNNER_TOKEN=${github_runner_token}
+      RUNNER_LABELS=${runner_labels}
+      RUNNER_VERSION=${runner_version}
+      RUNNER_USER=${runner_user}
+  - path: /opt/gh-runner/bootstrap-github-runner.sh
+    permissions: "0755"
+    owner: root:root
+    encoding: b64
+    content: ${bootstrap_script_b64}
+  - path: /etc/systemd/system/gh-runner-bootstrap.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=gh-runner GitHub runner bootstrap (oneshot)
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=!/var/lib/gh-runner/.bootstrap-complete
+
+      [Service]
+      Type=oneshot
+      ExecStartPre=/usr/bin/install -d -m 0755 /var/lib/gh-runner
+      ExecStart=/opt/gh-runner/bootstrap-github-runner.sh
+      ExecStartPost=/usr/bin/touch /var/lib/gh-runner/.bootstrap-complete
+      RemainAfterExit=yes
+      StandardOutput=journal
+      StandardError=journal
+      TimeoutStartSec=30min
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - [systemctl, daemon-reload]
+  - [systemctl, enable, gh-runner-bootstrap.service]
+  - [systemctl, start, "--no-block", gh-runner-bootstrap.service]
