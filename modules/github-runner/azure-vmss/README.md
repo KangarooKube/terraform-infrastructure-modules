@@ -16,6 +16,12 @@ What this module creates (all in a freshly-created resource group):
   cloud-init that installs Docker + the `actions/runner` agent and
   registers each instance against the target repo
 
+The runner user (default `azureuser`) is granted passwordless `sudo`
+via `/etc/sudoers.d/90-<user>-nopasswd` so CI jobs running on the
+runner can do `sudo apt-get install …` / `sudo systemctl …` without
+interactive prompts. The sudoers fragment is validated with
+`visudo -c -f` before installation.
+
 The bootstrap is idempotent: re-applying with a new registration token
 (VMSS `upgrade_mode = "Automatic"` rolls the new `custom_data` out, which
 re-runs cloud-init via reimage and re-registers the runner with the
