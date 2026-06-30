@@ -43,6 +43,10 @@ Common knobs (full list in [`vars.tf`](./vars.tf)):
 | `os_disk_size_gb` | `1024`               | Premium SSD. Sized for Docker image layers + workspace data.                     |
 | `runner_labels`   | `["self-hosted-azure"]` | Custom labels appended to the implicit `self-hosted, Linux, X64`.             |
 | `runner_version`  | `2.331.0`            | actions/runner release tag.                                                      |
+| `upgrade_mode`    | `Automatic`          | `Manual`, `Automatic`, or `Rolling`. `Automatic`/`Rolling` reimage existing instances on model changes (re-registering the runner with the latest token) but require a health signal — set `health_extension_enabled = true`. |
+| `rolling_upgrade_policy` | `{ max_batch_instance_percent = 50, max_unhealthy_instance_percent = 50, max_unhealthy_upgraded_instance_percent = 50, pause_time_between_batches = "PT2M" }` | Applied only for `Automatic`/`Rolling` (invalid for `Manual`). Set to `null` to omit the block. |
+| `health_extension_enabled` | `false`     | Deploys the Application Health (Linux) extension. **Required for `Automatic`/`Rolling`** — without a health signal Azure marks every instance unhealthy and the rolling upgrade fails before the first batch. |
+| `health_extension` | `{ protocol = "tcp", port = 22 }` | Probe used when `health_extension_enabled = true`. `protocol` is `tcp`/`http`/`https`; `request_path` is required (and must return 200) for `http`/`https`. The default `tcp:22` reports healthy whenever sshd is reachable. |
 
 ## Outputs
 

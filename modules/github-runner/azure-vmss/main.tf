@@ -178,21 +178,49 @@ resource "azurerm_linux_virtual_machine_scale_set" "this" {
   admin_username      = var.admin_username
   tags                = var.tags
 
-  # Automatic: when `terraform apply` changes the model (e.g. new custom_data
-  # because gh api minted a fresh registration token), Azure rolls the model
-  # out to all instances. For Linux VMSS this re-runs cloud-init via reimage,
-  # so the bootstrap re-registers the runner with the latest token.
-  upgrade_mode                    = "Automatic"
+  # upgrade_mode drives how Terraform model changes (e.g. new custom_data
+  # because gh api minted a fresh registration token) reach existing instances.
+  # Automatic/Rolling roll the new model out via reimage (re-running cloud-init,
+  # which re-registers the runner with the latest token) but require a health
+  # signal to evaluate the rollout — enable health_extension_enabled for those
+  # modes. Manual leaves existing instances untouched until manually upgraded.
+  upgrade_mode                    = var.upgrade_mode
   single_placement_group          = true
   platform_fault_domain_count     = 1
   disable_password_authentication = true
   overprovision                   = false
 
-  rolling_upgrade_policy {
-    max_batch_instance_percent              = 50
-    max_unhealthy_instance_percent          = 50
-    max_unhealthy_upgraded_instance_percent = 50
-    pause_time_between_batches              = "PT2M"
+  # Only valid for Automatic/Rolling upgrade modes; Azure rejects the block for
+  # Manual. Set var.rolling_upgrade_policy to null to omit it explicitly.
+  dynamic "rolling_upgrade_policy" {
+    for_each = (contains(["Automatic", "Rolling"], var.upgrade_mode) && var.rolling_upgrade_policy != null) ? [var.rolling_upgrade_policy] : []
+    content {
+      max_batch_instance_percent              = rolling_upgrade_policy.value.max_batch_instance_percent
+      max_unhealthy_instance_percent          = rolling_upgrade_policy.value.max_unhealthy_instance_percent
+      max_unhealthy_upgraded_instance_percent = rolling_upgrade_policy.value.max_unhealthy_upgraded_instance_percent
+      pause_time_between_batches              = rolling_upgrade_policy.value.pause_time_between_batches
+    }
+  }
+
+  # Application Health (Linux) extension: gives Azure a real per-instance health
+  # signal so Automatic/Rolling upgrades can proceed instead of treating every
+  # instance as unhealthy.
+  dynamic "extension" {
+    for_each = var.health_extension_enabled ? [var.health_extension] : []
+    content {
+      name                       = "ApplicationHealthLinux"
+      publisher                  = "Microsoft.ManagedServices"
+      type                       = "ApplicationHealthLinux"
+      type_handler_version       = "1.0"
+      auto_upgrade_minor_version = true
+      settings = jsonencode(merge(
+        {
+          protocol = extension.value.protocol
+          port     = extension.value.port
+        },
+        try(extension.value.request_path, null) == null ? {} : { requestPath = extension.value.request_path }
+      ))
+    }
   }
 
   custom_data = base64encode(local.cloud_init_rendered)
