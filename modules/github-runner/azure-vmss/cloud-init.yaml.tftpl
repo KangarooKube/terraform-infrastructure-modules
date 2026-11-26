@@ -9,11 +9,20 @@ write_files:
       RUNNER_LABELS=${runner_labels}
       RUNNER_VERSION=${runner_version}
       RUNNER_USER=${runner_user}
+      EXTRA_APT_PACKAGES="${extra_apt_packages}"
+      JOB_CLEANUP_ENABLED=${job_cleanup_enabled}
   - path: /opt/gh-runner/bootstrap-github-runner.sh
     permissions: "0755"
     owner: root:root
     encoding: b64
     content: ${bootstrap_script_b64}
+%{ if extra_bootstrap_script_b64 != "" ~}
+  - path: /opt/gh-runner/extra-bootstrap.sh
+    permissions: "0700"
+    owner: root:root
+    encoding: b64
+    content: ${extra_bootstrap_script_b64}
+%{ endif ~}
   - path: /etc/systemd/system/gh-runner-bootstrap.service
     permissions: "0644"
     owner: root:root
