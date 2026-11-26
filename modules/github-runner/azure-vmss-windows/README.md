@@ -57,25 +57,32 @@ default `self-hosted, Windows, X64` labels plus `runner_labels`.
 
 ### Registration and job readiness
 
-The registration token expires an hour after it is minted, and a Build Tools
-install alone can take 20 minutes, so the bootstrap registers the runner
-**before** installing tools:
+The registration token expires an hour after it is minted, and boot plus the
+Build Tools install can take a good part of that, so the bootstrap registers the runner
+**before** installing tools, but only lets it take jobs afterwards:
 
-1. Download the runner, write its `.env` (the PATH the machine will have once
-   every tool is installed, plus the hook settings), and register it. The
-   service starts immediately.
-2. Install the tools. Every runner job is held by a job-started hook
-   (`C:\gh-runner\hooks\job-started.ps1`) that waits until the bootstrap
-   writes `C:\gh-runner\ready`, for up to 120 minutes.
-3. If the installers added anything else to the machine PATH, rewrite `.env`
-   and restart the runner service, then write the ready marker.
-4. If an installer asked for a reboot and no job is running, restart the
-   instance. The runner service starts on boot.
+1. Download the runner and register it. Configure starts the service; the
+   bootstrap stops it at once and sets it to manual start, so the runner shows
+   offline in GitHub while tools install.
+2. Install the tools.
+3. Write the runner's `.env` (the final machine PATH with `Git\bin` first, the
+   rustup variables and the hook settings) and the ready marker
+   `C:\gh-runner\ready`.
+4. Set the service to delayed automatic start and start it, once. If an
+   installer asked for a reboot, the instance restarts instead and the service
+   starts on boot.
+
+So a runner that shows **online** is fully bootstrapped, and it is never
+restarted under a job. On a new VMSS or an `az vmss reimage`, the Azure
+operation (and so `terraform apply`) returns only after the bootstrap
+extension finishes. As a backstop, a job-started hook
+(`C:\gh-runner\hooks\job-started.ps1`) holds any job until the ready marker
+exists, for up to 120 minutes.
 
 If the bootstrap fails, it disables the runner service so the broken instance
 does not take jobs, and the extension reports the failure. The bootstrap is
-idempotent: when it reruns on an instance whose runner is registered, running
-and bootstrapped by the same script, it exits without changes.
+idempotent: when it reruns on an instance whose runner is registered and
+bootstrapped by the same script, it only makes sure the service is running.
 
 ### Job cleanup
 

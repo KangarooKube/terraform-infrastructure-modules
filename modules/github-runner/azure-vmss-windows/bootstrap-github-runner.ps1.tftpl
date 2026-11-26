@@ -215,9 +215,10 @@ function Install-RunnerPackage {
 }
 
 function Write-JobHooks {
-    # Jobs can be assigned as soon as the runner registers, which happens before
-    # the slow tool installs so the 1-hour registration token is used early. This
-    # hook holds each job until the bootstrap marks the machine ready.
+    # The runner service is stopped right after registration and only started
+    # once the bootstrap marks the machine ready. This hook is the backstop for
+    # a job that lands in the moment between configure starting the service and
+    # the bootstrap stopping it.
     $started = @'
 $ready = 'C:\gh-runner\ready'
 if (Test-Path -LiteralPath $ready) { exit 0 }
@@ -302,8 +303,12 @@ function Wait-Until([scriptblock]$Condition, [int]$TimeoutSeconds, [string]$What
 }
 
 function Stop-RunnerService([string]$Name) {
-    $null = Invoke-Capture (Join-Path $System32 'sc.exe') @('stop', $Name)
-    Wait-Until { @('STOPPED', 'MISSING') -contains (Get-ServiceState $Name) } 120 ('{0} to stop' -f $Name)
+    $sc = Join-Path $System32 'sc.exe'
+    Wait-Until {
+        $state = Get-ServiceState $Name
+        if ($state -eq 'RUNNING') { $null = Invoke-Capture $sc @('stop', $Name) }
+        @('STOPPED', 'MISSING') -contains $state
+    } 120 ('{0} to stop' -f $Name)
 }
 
 function Remove-RunnerRegistration {
@@ -336,26 +341,21 @@ function Join-PathEntries([string[]]$Entries) {
     return ($kept -join ';')
 }
 
-# The PATH the machine will have once every tool is installed, so the runner
-# service can start before the installs and still hand jobs the final PATH.
-function Get-PlannedPath {
+# Git\bin first so `bash` is Git Bash rather than System32's WSL launcher, then
+# the machine PATH the installers produced, then tool directories installers
+# leave off the machine PATH (rustup only edits the installing user's PATH).
+function Get-RunnerPath {
     $entries = @(Join-Path $GitRoot 'bin')
     $entries += [Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';'
-    $entries += @((Join-Path $GitRoot 'cmd'), (Join-Path $GitRoot 'mingw64\bin'), (Join-Path $GitRoot 'usr\bin'), $PwshDir)
+    $entries += @((Join-Path $GitRoot 'cmd'), (Join-Path $GitRoot 'usr\bin'), $PwshDir)
     if ($InstallGh) { $entries += $GhDir }
     if ($InstallRustup) { $entries += (Join-Path $CargoHome 'bin') }
     return Join-PathEntries $entries
 }
 
-function Get-RunnerEnvPath {
-    $line = Get-Content (Join-Path $RunnerHome '.env') -ErrorAction SilentlyContinue | Where-Object { $_ -like 'PATH=*' } | Select-Object -First 1
-    if ($null -eq $line) { return '' }
-    return $line.Substring(5)
-}
-
 function Write-RunnerEnv([string]$PathValue) {
     # The runner service only sees the environment SCM had at boot; the runner
-    # loads this file on start.
+    # loads this file when it starts.
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('PATH=' + $PathValue)
     if ($InstallRustup) {
@@ -378,11 +378,14 @@ function Test-BootstrapCurrent {
     return (Test-Path $ReadyFile) -and
         (Test-Path (Join-Path $RunnerHome '.runner')) -and
         $services.Count -eq 1 -and
-        (Get-ServiceState $services[0]) -eq 'RUNNING' -and
+        (Get-ServiceState $services[0]) -ne 'MISSING' -and
         (Test-Path $FingerprintFile) -and
         ((Get-Content -Raw $FingerprintFile).Trim() -eq (Get-Fingerprint))
 }
 
+# Registers early so the 1-hour registration token is spent before the slow
+# tool installs, then keeps the service stopped so no job is assigned until the
+# machine is ready.
 function Register-Runner {
     $listener = Join-Path $RunnerHome 'bin\Runner.Listener.exe'
     $configureArgs = @(
@@ -397,7 +400,7 @@ function Register-Runner {
         '--windowslogonaccount', ('{0}\{1}' -f $env:COMPUTERNAME, $RunnerUser),
         '--windowslogonpassword', $AdminPassword
     )
-    $plannedPath = Get-PlannedPath
+    $plannedPath = Get-RunnerPath
 
     $attempt = 0
     while ($true) {
@@ -417,22 +420,20 @@ function Register-Runner {
 
     $services = @(Get-RunnerServiceNames)
     if ($services.Count -ne 1) { throw ('Expected one runner service, found {0}' -f $services.Count) }
-    Wait-Until { (Get-ServiceState $services[0]) -eq 'RUNNING' } 120 ('{0} to start' -f $services[0])
-    Write-Log ('Runner service {0} is running; jobs wait for the bootstrap to finish' -f $services[0])
+    Stop-RunnerService $services[0]
+    $null = Invoke-Capture (Join-Path $System32 'sc.exe') @('config', $services[0], 'start=', 'demand')
+    Write-Log ('Runner registered; service {0} stays stopped until the bootstrap finishes' -f $services[0])
 }
 
-function Sync-RunnerEnv {
-    $current = Get-RunnerEnvPath
-    $known = @{}
-    foreach ($entry in $current -split ';') { if ($entry -ne '') { $known[(Get-PathKey $entry)] = $true } }
-    $missing = @([Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';' | Where-Object { $_ -ne '' -and -not $known.ContainsKey((Get-PathKey $_)) })
-    if ($missing.Count -eq 0) { return }
-    Write-Log ('Machine PATH gained {0}; restarting the runner service to pick it up' -f ($missing -join ';'))
-    Write-RunnerEnv (Join-PathEntries (@($current -split ';') + $missing))
+function Start-RunnerService {
+    $sc = Join-Path $System32 'sc.exe'
     foreach ($name in Get-RunnerServiceNames) {
-        Stop-RunnerService $name
-        $null = Invoke-Capture (Join-Path $System32 'sc.exe') @('start', $name)
-        Wait-Until { (Get-ServiceState $name) -eq 'RUNNING' } 120 ('{0} to start' -f $name)
+        $null = Invoke-Capture $sc @('config', $name, 'start=', 'delayed-auto')
+        if ((Get-ServiceState $name) -ne 'RUNNING') {
+            $null = Invoke-Capture $sc @('start', $name)
+            Wait-Until { (Get-ServiceState $name) -eq 'RUNNING' } 120 ('{0} to start' -f $name)
+        }
+        Write-Log ('Runner service {0} is running' -f $name)
     }
 }
 
@@ -447,7 +448,8 @@ function Disable-RunnerServices {
 try {
     Write-Log ('Bootstrap starting: runner {0} for {1} on {2}' -f $RunnerVersion, $GithubRepo, $env:COMPUTERNAME)
     if (Test-BootstrapCurrent) {
-        Write-Log 'Runner already registered, running and bootstrapped by this script; nothing to do'
+        Write-Log 'Runner already registered and bootstrapped by this script'
+        Start-RunnerService
         exit 0
     }
     Remove-Item -Force -ErrorAction SilentlyContinue $ReadyFile, $FingerprintFile
@@ -461,20 +463,21 @@ try {
     if ($InstallMsvc) { Install-MsvcBuildTools }
     if ($InstallRustup) { Install-Rustup }
     Invoke-ExtraBootstrap
-    Sync-RunnerEnv
+    Write-RunnerEnv (Get-RunnerPath)
     Set-Content -Path $ReadyFile -Value (Get-Date -Format o) -Encoding ASCII
-    Set-Content -Path $FingerprintFile -Value (Get-Fingerprint) -Encoding ASCII
-    Write-Log 'Bootstrap finished; runner is ready for jobs'
 
     if ($script:RebootRequired) {
-        if (Get-Process -Name 'Runner.Worker' -ErrorAction SilentlyContinue) {
-            Write-Log 'An installer requested a reboot, but a job is running; skipping it'
-        } else {
-            Write-Log 'An installer requested a reboot; restarting in 30 seconds (the runner service starts on boot)'
-            foreach ($name in Get-RunnerServiceNames) { Stop-RunnerService $name }
-            $null = Invoke-Capture (Join-Path $System32 'shutdown.exe') @('/r', '/t', '30', '/d', 'p:4:1', '/c', 'gh-runner bootstrap')
+        foreach ($name in Get-RunnerServiceNames) {
+            $null = Invoke-Capture (Join-Path $System32 'sc.exe') @('config', $name, 'start=', 'delayed-auto')
         }
+        Set-Content -Path $FingerprintFile -Value (Get-Fingerprint) -Encoding ASCII
+        Write-Log 'Bootstrap finished; an installer requested a reboot, so the runner service starts after it in 30 seconds'
+        $null = Invoke-Capture (Join-Path $System32 'shutdown.exe') @('/r', '/t', '30', '/d', 'p:4:1', '/c', 'gh-runner bootstrap')
+        exit 0
     }
+    Start-RunnerService
+    Set-Content -Path $FingerprintFile -Value (Get-Fingerprint) -Encoding ASCII
+    Write-Log 'Bootstrap finished; runner is ready for jobs'
     exit 0
 } catch {
     Write-Log ('Bootstrap failed: {0}' -f $_.Exception.Message)
