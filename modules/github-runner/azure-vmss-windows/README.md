@@ -22,9 +22,10 @@ In both modes it creates:
 - Subnet `snet-runners-windows` (default `10.0.3.0/24`) and NSG
   `<name_prefix>-nsg-runners`: inbound RDP only from the Bastion subnet, all
   other inbound denied, outbound to the VNet and Internet.
-- `<name_prefix>-vmss-runner`: Windows Server 2025 Datacenter Azure Edition
-  (Gen2, Trusted Launch), Premium SSD OS disk, system-assigned identity, boot
-  diagnostics, and a local administrator with a generated password.
+- `<name_prefix>-vmss-runner`: Windows Server 2025 Datacenter (Gen2, Trusted
+  Launch), Premium SSD OS disk, system-assigned identity, boot diagnostics,
+  automatic Windows Updates disabled (so no update reboots during jobs), and a
+  local administrator with a generated password.
 - The `gh-runner-bootstrap` CustomScriptExtension and, by default, the
   Application Health (Windows) extension, provisioned after the bootstrap.
 
@@ -141,7 +142,7 @@ Full list in [`vars.tf`](./vars.tf):
 | `instance_count` | `1` | |
 | `instance_sku` | `Standard_D8as_v5` | Must support Trusted Launch. |
 | `os_disk_size_gb` | `256` | Premium SSD. |
-| `vm_image` | `WindowsServer` / `2025-datacenter-azure-edition` / `latest` | Must be Gen2. |
+| `vm_image` | `WindowsServer` / `2025-datacenter-g2` / `latest` | Must be Gen2. Azure Edition (Hotpatch) images are rejected because they require platform-managed patching. |
 | `admin_username` | `runneradmin` | The runner service logs on as this local administrator. |
 | `admin_password` | generated | Letters, digits and `-_.@+` only, 12-123 characters. |
 | `tags` | `{ purpose, managed }` | Applied to every resource. |

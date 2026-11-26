@@ -100,11 +100,11 @@ variable "vm_image" {
     sku       = string
     version   = string
   })
-  description = "Source image for the VMSS instances. Must be a Gen2 image (Trusted Launch is enabled)."
+  description = "Source image for the VMSS instances. Must be a Gen2 image (Trusted Launch is enabled). Azure Edition images are Hotpatch-compatible and Azure requires platform-managed patching (patchMode AutomaticByPlatform) for them, which this module does not use, so they are not supported."
   default = {
     publisher = "MicrosoftWindowsServer"
     offer     = "WindowsServer"
-    sku       = "2025-datacenter-azure-edition"
+    sku       = "2025-datacenter-g2"
     version   = "latest"
   }
 }
