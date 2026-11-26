@@ -1,0 +1,485 @@
+# Rendered by Terraform (modules/github-runner/azure-vmss-windows) and delivered as
+# VMSS custom_data (C:\AzureData\CustomData.bin). The gh-runner-bootstrap
+# CustomScriptExtension copies it to a .ps1 and runs it as SYSTEM on first boot,
+# on every reimage and whenever the registration token changes. The secrets
+# arrive only as parameters from the extension's protected settings; never log them.
+param(
+    [Parameter(Mandatory = $true)][string]$RunnerToken,
+    [Parameter(Mandatory = $true)][string]$AdminPassword
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+$GithubRepo     = '${github_repo}'
+$RunnerLabels   = '${runner_labels}'
+$RunnerVersion  = '${runner_version}'
+$RunnerUser     = '${runner_user}'
+$GitVersion     = '${git_version}'
+$PwshVersion    = '${pwsh_version}'
+$GhVersion      = '${gh_version}'
+$InstallGh      = [bool]::Parse('${install_gh_cli}')
+$InstallMsvc    = [bool]::Parse('${install_msvc_build_tools}')
+$InstallRustup  = [bool]::Parse('${install_rustup}')
+$RustToolchain  = '${rust_toolchain}'
+$JobCleanup     = [bool]::Parse('${job_cleanup_enabled}')
+$ExtraScriptB64 = '${extra_bootstrap_script_b64}'
+
+$StateDir    = 'C:\gh-runner'
+$HookDir     = 'C:\gh-runner\hooks'
+$DownloadDir = 'C:\gh-runner\downloads'
+$LogFile     = 'C:\gh-runner\bootstrap.log'
+$ReadyFile   = 'C:\gh-runner\ready'
+$FingerprintFile = 'C:\gh-runner\registration.fingerprint'
+$RunnerHome  = 'C:\actions-runner'
+$GitRoot     = 'C:\Program Files\Git'
+$PwshDir     = 'C:\Program Files\PowerShell\7'
+$GhDir       = 'C:\Program Files\GitHub CLI'
+$RustupHome  = 'C:\rust\rustup'
+$CargoHome   = 'C:\rust\cargo'
+$System32    = Join-Path $env:SystemRoot 'System32'
+$EnvKey      = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
+$ServicesKey = 'HKLM:\SYSTEM\CurrentControlSet\Services'
+
+$script:RebootRequired = $false
+
+New-Item -ItemType Directory -Force -Path $StateDir, $HookDir, $DownloadDir | Out-Null
+
+function Write-Log([string]$Message) {
+    $line = '{0} {1}' -f (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK'), $Message
+    Write-Host $line
+    Add-Content -Path $LogFile -Value $line -Encoding UTF8
+}
+
+# Runs a console program, streams its output to the log and fails on unexpected
+# exit codes. Windows PowerShell turns native stderr into terminating errors
+# under 'Stop', so relax it while the program runs.
+function Invoke-Native([string]$FilePath, [string[]]$ArgumentList = @(), [int[]]$AllowedExitCodes = @(0)) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $FilePath @ArgumentList 2>&1 | ForEach-Object { Write-Log ('  ' + $_) }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($AllowedExitCodes -notcontains $code) {
+        throw ('{0} exited with code {1}' -f (Split-Path -Leaf $FilePath), $code)
+    }
+}
+
+function Invoke-Capture([string]$FilePath, [string[]]$ArgumentList = @()) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        return (& $FilePath @ArgumentList 2>&1 | Out-String)
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
+# GUI-subsystem installers (Inno Setup, msiexec, VS bootstrapper) do not block the
+# call operator, so wait on the process itself rather than its whole tree.
+function Invoke-Installer([string]$FilePath, [string]$Arguments, [int[]]$AllowedExitCodes = @(0)) {
+    Write-Log ('Running {0}' -f (Split-Path -Leaf $FilePath))
+    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments -PassThru -WindowStyle Hidden
+    $null = $process.Handle
+    $process.WaitForExit()
+    $code = $process.ExitCode
+    if ($AllowedExitCodes -notcontains $code) {
+        throw ('{0} exited with code {1}' -f (Split-Path -Leaf $FilePath), $code)
+    }
+    if ($code -eq 3010 -or $code -eq 1641) {
+        Write-Log ('{0} requested a reboot' -f (Split-Path -Leaf $FilePath))
+        $script:RebootRequired = $true
+    }
+}
+
+function Get-Download([string]$Url, [string]$FileName) {
+    $destination = Join-Path $DownloadDir $FileName
+    if (-not (Test-Path $destination)) {
+        Write-Log ('Downloading {0}' -f $Url)
+        $partial = $destination + '.partial'
+        Invoke-Native (Join-Path $System32 'curl.exe') @('-fsSL', '--retry', '5', '--retry-delay', '5', '--retry-all-errors', '-o', $partial, $Url)
+        Move-Item -Force -Path $partial -Destination $destination
+    }
+    return $destination
+}
+
+function Add-MachinePath([string]$Directory, [switch]$Prepend) {
+    $raw = (Get-Item $EnvKey).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+    $parts = @($raw -split ';' | Where-Object { $_ -ne '' -and $_ -ne $Directory })
+    if ($Prepend) { $parts = @($Directory) + $parts } else { $parts = $parts + @($Directory) }
+    $updated = $parts -join ';'
+    if ($updated -ne $raw) {
+        Set-ItemProperty -Path $EnvKey -Name Path -Value $updated -Type ExpandString
+    }
+    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+}
+
+function Enable-LongPaths {
+    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -Value 1 -Type DWord
+}
+
+function Install-Git {
+    if (Test-Path (Join-Path $GitRoot 'bin\bash.exe')) {
+        Write-Log 'Git for Windows already installed'
+    } else {
+        $parts = $GitVersion -split '\.windows\.'
+        if ([int]$parts[1] -le 1) {
+            $asset = 'Git-{0}-64-bit.exe' -f $parts[0]
+        } else {
+            $asset = 'Git-{0}.{1}-64-bit.exe' -f $parts[0], $parts[1]
+        }
+        $installer = Get-Download ('https://github.com/git-for-windows/git/releases/download/v{0}/{1}' -f $GitVersion, $asset) $asset
+        Invoke-Installer $installer '/VERYSILENT /NORESTART /NOCANCEL /SP- /SUPPRESSMSGBOXES /CLOSEAPPLICATIONS /o:PathOption=CmdTools /o:BashTerminalOption=ConHost /o:EnableSymlinks=Enabled /COMPONENTS=gitlfs'
+    }
+    # Git's bin first so `shell: bash` resolves to Git Bash, as on hosted runners.
+    Add-MachinePath (Join-Path $GitRoot 'bin') -Prepend
+    Add-MachinePath (Join-Path $GitRoot 'cmd')
+    Invoke-Native (Join-Path $GitRoot 'cmd\git.exe') @('config', '--system', 'core.longpaths', 'true')
+}
+
+function Install-Pwsh {
+    if (Test-Path (Join-Path $PwshDir 'pwsh.exe')) {
+        Write-Log 'PowerShell 7 already installed'
+    } else {
+        $asset = 'PowerShell-{0}-win-x64.msi' -f $PwshVersion
+        $msi = Get-Download ('https://github.com/PowerShell/PowerShell/releases/download/v{0}/{1}' -f $PwshVersion, $asset) $asset
+        Invoke-Installer (Join-Path $System32 'msiexec.exe') ('/i "{0}" /qn /norestart /l*v "{1}" ADD_PATH=1 REGISTER_MANIFEST=1 USE_MU=0 ENABLE_MU=0' -f $msi, (Join-Path $StateDir 'pwsh-msi.log')) @(0, 3010, 1641)
+    }
+    Add-MachinePath $PwshDir
+}
+
+function Install-GhCli {
+    if (Test-Path (Join-Path $GhDir 'gh.exe')) {
+        Write-Log 'GitHub CLI already installed'
+    } else {
+        $asset = 'gh_{0}_windows_amd64.msi' -f $GhVersion
+        $msi = Get-Download ('https://github.com/cli/cli/releases/download/v{0}/{1}' -f $GhVersion, $asset) $asset
+        Invoke-Installer (Join-Path $System32 'msiexec.exe') ('/i "{0}" /qn /norestart /l*v "{1}"' -f $msi, (Join-Path $StateDir 'gh-msi.log')) @(0, 3010, 1641)
+    }
+    Add-MachinePath $GhDir
+}
+
+function Test-MsvcInstalled {
+    $vswhere = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (-not (Test-Path $vswhere)) { return $false }
+    $found = Invoke-Capture $vswhere @('-products', '*', '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath')
+    return -not [string]::IsNullOrWhiteSpace($found)
+}
+
+function Install-MsvcBuildTools {
+    if (Test-MsvcInstalled) {
+        Write-Log 'MSVC build tools already installed'
+        return
+    }
+    $installer = Get-Download 'https://aka.ms/vs/17/release/vs_buildtools.exe' 'vs_buildtools.exe'
+    Invoke-Installer $installer '--quiet --wait --norestart --nocache --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended' @(0, 3010, 1641)
+    if (-not (Test-MsvcInstalled)) { throw 'MSVC build tools are missing after installation' }
+}
+
+function Install-Rustup {
+    [Environment]::SetEnvironmentVariable('RUSTUP_HOME', $RustupHome, 'Machine')
+    [Environment]::SetEnvironmentVariable('CARGO_HOME', $CargoHome, 'Machine')
+    $env:RUSTUP_HOME = $RustupHome
+    $env:CARGO_HOME = $CargoHome
+    $rustup = Join-Path $CargoHome 'bin\rustup.exe'
+    if (Test-Path $rustup) {
+        Invoke-Native $rustup @('toolchain', 'install', $RustToolchain, '--profile', 'minimal', '-c', 'clippy', '-c', 'rustfmt')
+        Invoke-Native $rustup @('default', $RustToolchain)
+    } else {
+        $init = Get-Download 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe' 'rustup-init.exe'
+        Invoke-Native $init @('-y', '--no-modify-path', '--profile', 'minimal', '--default-host', 'x86_64-pc-windows-msvc', '--default-toolchain', $RustToolchain, '-c', 'clippy', '-c', 'rustfmt')
+    }
+    Add-MachinePath (Join-Path $CargoHome 'bin')
+}
+
+function Invoke-ExtraBootstrap {
+    if ($ExtraScriptB64 -eq '') { return }
+    $extra = Join-Path $StateDir 'extra-bootstrap.ps1'
+    [IO.File]::WriteAllBytes($extra, [Convert]::FromBase64String($ExtraScriptB64))
+    Write-Log 'Running extra bootstrap script'
+    Invoke-Native (Join-Path $System32 'WindowsPowerShell\v1.0\powershell.exe') @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $extra)
+}
+
+function Install-RunnerPackage {
+    if (Test-Path (Join-Path $RunnerHome 'bin\Runner.Listener.exe')) {
+        Write-Log 'Runner package already present'
+        return
+    }
+    $asset = 'actions-runner-win-x64-{0}.zip' -f $RunnerVersion
+    $zip = Get-Download ('https://github.com/actions/runner/releases/download/v{0}/{1}' -f $RunnerVersion, $asset) $asset
+    New-Item -ItemType Directory -Force -Path $RunnerHome | Out-Null
+    Invoke-Native (Join-Path $System32 'tar.exe') @('-xf', $zip, '-C', $RunnerHome)
+}
+
+function Write-JobHooks {
+    # Jobs can be assigned as soon as the runner registers, which happens before
+    # the slow tool installs so the 1-hour registration token is used early. This
+    # hook holds each job until the bootstrap marks the machine ready.
+    $started = @'
+$ready = 'C:\gh-runner\ready'
+if (Test-Path -LiteralPath $ready) { exit 0 }
+Write-Host 'gh-runner: waiting for the runner bootstrap to finish installing tools'
+$deadline = (Get-Date).AddMinutes(120)
+while (-not (Test-Path -LiteralPath $ready)) {
+    if ((Get-Date) -gt $deadline) {
+        Write-Host 'gh-runner: the runner bootstrap did not finish within 120 minutes; see C:\gh-runner\bootstrap.log'
+        exit 1
+    }
+    Start-Sleep -Seconds 15
+}
+Write-Host 'gh-runner: runner bootstrap finished'
+exit 0
+'@
+    Set-Content -Path (Join-Path $HookDir 'job-started.ps1') -Value $started -Encoding ASCII
+
+    $completedPath = Join-Path $HookDir 'job-completed.ps1'
+    if (-not $JobCleanup) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $completedPath
+        return
+    }
+    # Runs under pwsh 7 (the runner prefers pwsh for .ps1 hooks), whose
+    # Remove-Item deletes links instead of following them.
+    $completed = @'
+$ErrorActionPreference = 'Continue'
+function Write-HookLog([string]$Message) { Write-Host ('gh-runner cleanup: ' + $Message) }
+try {
+    if ($PSVersionTable.PSVersion.Major -lt 7) { Write-HookLog 'needs PowerShell 7; skipping'; exit 0 }
+    $root = [IO.Path]::GetFullPath('C:\actions-runner\_work').TrimEnd('\')
+    $workspace = $env:GITHUB_WORKSPACE
+    if ([string]::IsNullOrWhiteSpace($workspace)) { Write-HookLog 'GITHUB_WORKSPACE is empty; skipping'; exit 0 }
+    $target = [IO.Path]::GetFullPath($workspace).TrimEnd('\')
+    if (-not $target.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) {
+        Write-HookLog ('refusing {0}: not beneath {1}' -f $target, $root)
+        exit 0
+    }
+    if (-not (Test-Path -LiteralPath $target -PathType Container)) { exit 0 }
+    $dir = $target
+    while ($true) {
+        if ((Get-Item -LiteralPath $dir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            Write-HookLog ('refusing {0}: {1} is a link' -f $target, $dir)
+            exit 0
+        }
+        if ($dir.Length -le $root.Length) { break }
+        $dir = [IO.Path]::GetDirectoryName($dir)
+    }
+    $failed = 0
+    foreach ($child in @(Get-ChildItem -LiteralPath $target -Force)) {
+        try {
+            Remove-Item -LiteralPath $child.FullName -Recurse -Force -ErrorAction Stop
+        } catch {
+            $failed++
+            Write-HookLog ('could not remove {0}: {1}' -f $child.FullName, $_.Exception.Message)
+        }
+    }
+    if ($failed -eq 0) { Write-HookLog ('cleaned {0}' -f $target) }
+} catch {
+    Write-HookLog ('error: {0}' -f $_.Exception.Message)
+}
+exit 0
+'@
+    Set-Content -Path $completedPath -Value $completed -Encoding ASCII
+}
+
+function Get-ServiceState([string]$Name) {
+    $output = Invoke-Capture (Join-Path $System32 'sc.exe') @('query', $Name)
+    if ($output -match 'STATE\s+:\s+\d+\s+(\w+)') { return $Matches[1] }
+    return 'MISSING'
+}
+
+function Get-RunnerServiceNames {
+    return @(Get-ChildItem $ServicesKey | Where-Object { $_.PSChildName -like 'actions.runner.*' } | ForEach-Object { $_.PSChildName })
+}
+
+function Wait-Until([scriptblock]$Condition, [int]$TimeoutSeconds, [string]$What) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while (-not (& $Condition)) {
+        if ((Get-Date) -gt $deadline) { throw ('Timed out waiting for {0}' -f $What) }
+        Start-Sleep -Seconds 2
+    }
+}
+
+function Stop-RunnerService([string]$Name) {
+    $null = Invoke-Capture (Join-Path $System32 'sc.exe') @('stop', $Name)
+    Wait-Until { @('STOPPED', 'MISSING') -contains (Get-ServiceState $Name) } 120 ('{0} to stop' -f $Name)
+}
+
+function Remove-RunnerRegistration {
+    foreach ($name in Get-RunnerServiceNames) {
+        Write-Log ('Removing runner service {0}' -f $name)
+        Stop-RunnerService $name
+        $null = Invoke-Capture (Join-Path $System32 'sc.exe') @('delete', $name)
+        Wait-Until { -not (Test-Path (Join-Path $ServicesKey $name)) } 120 ('{0} to be deleted' -f $name)
+    }
+    foreach ($file in @('.runner', '.credentials', '.credentials_rsaparams', '.service')) {
+        Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $RunnerHome $file)
+    }
+}
+
+function Get-PathKey([string]$Entry) {
+    return $Entry.Trim().TrimEnd('\').ToLowerInvariant()
+}
+
+function Join-PathEntries([string[]]$Entries) {
+    $seen = @{}
+    $kept = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in $Entries) {
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+        $key = Get-PathKey $entry
+        if (-not $seen.ContainsKey($key)) {
+            $seen[$key] = $true
+            $kept.Add($entry)
+        }
+    }
+    return ($kept -join ';')
+}
+
+# The PATH the machine will have once every tool is installed, so the runner
+# service can start before the installs and still hand jobs the final PATH.
+function Get-PlannedPath {
+    $entries = @(Join-Path $GitRoot 'bin')
+    $entries += [Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';'
+    $entries += @((Join-Path $GitRoot 'cmd'), (Join-Path $GitRoot 'mingw64\bin'), (Join-Path $GitRoot 'usr\bin'), $PwshDir)
+    if ($InstallGh) { $entries += $GhDir }
+    if ($InstallRustup) { $entries += (Join-Path $CargoHome 'bin') }
+    return Join-PathEntries $entries
+}
+
+function Get-RunnerEnvPath {
+    $line = Get-Content (Join-Path $RunnerHome '.env') -ErrorAction SilentlyContinue | Where-Object { $_ -like 'PATH=*' } | Select-Object -First 1
+    if ($null -eq $line) { return '' }
+    return $line.Substring(5)
+}
+
+function Write-RunnerEnv([string]$PathValue) {
+    # The runner service only sees the environment SCM had at boot; the runner
+    # loads this file on start.
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('PATH=' + $PathValue)
+    if ($InstallRustup) {
+        $lines.Add('RUSTUP_HOME=' + $RustupHome)
+        $lines.Add('CARGO_HOME=' + $CargoHome)
+    }
+    $lines.Add('ACTIONS_RUNNER_HOOK_JOB_STARTED=' + (Join-Path $HookDir 'job-started.ps1'))
+    if ($JobCleanup) {
+        $lines.Add('ACTIONS_RUNNER_HOOK_JOB_COMPLETED=' + (Join-Path $HookDir 'job-completed.ps1'))
+    }
+    [IO.File]::WriteAllLines((Join-Path $RunnerHome '.env'), $lines, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Get-Fingerprint {
+    return '{0}|{1}' -f (Get-FileHash -Algorithm SHA256 -Path $PSCommandPath).Hash, $env:COMPUTERNAME
+}
+
+function Test-BootstrapCurrent {
+    $services = @(Get-RunnerServiceNames)
+    return (Test-Path $ReadyFile) -and
+        (Test-Path (Join-Path $RunnerHome '.runner')) -and
+        $services.Count -eq 1 -and
+        (Get-ServiceState $services[0]) -eq 'RUNNING' -and
+        (Test-Path $FingerprintFile) -and
+        ((Get-Content -Raw $FingerprintFile).Trim() -eq (Get-Fingerprint))
+}
+
+function Register-Runner {
+    $listener = Join-Path $RunnerHome 'bin\Runner.Listener.exe'
+    $configureArgs = @(
+        'configure', '--unattended', '--replace',
+        '--url', $GithubRepo,
+        '--token', $RunnerToken,
+        '--name', $env:COMPUTERNAME,
+        '--labels', $RunnerLabels,
+        '--runnergroup', 'Default',
+        '--work', '_work',
+        '--runasservice',
+        '--windowslogonaccount', ('{0}\{1}' -f $env:COMPUTERNAME, $RunnerUser),
+        '--windowslogonpassword', $AdminPassword
+    )
+    $plannedPath = Get-PlannedPath
+
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        Remove-RunnerRegistration
+        Write-RunnerEnv $plannedPath
+        Write-Log ('Registering runner {0} with labels {1} (attempt {2})' -f $env:COMPUTERNAME, $RunnerLabels, $attempt)
+        try {
+            Invoke-Native $listener $configureArgs
+            break
+        } catch {
+            if ($attempt -ge 3) { throw }
+            Write-Log ('Runner registration failed: {0}; retrying' -f $_.Exception.Message)
+            Start-Sleep -Seconds 20
+        }
+    }
+
+    $services = @(Get-RunnerServiceNames)
+    if ($services.Count -ne 1) { throw ('Expected one runner service, found {0}' -f $services.Count) }
+    Wait-Until { (Get-ServiceState $services[0]) -eq 'RUNNING' } 120 ('{0} to start' -f $services[0])
+    Write-Log ('Runner service {0} is running; jobs wait for the bootstrap to finish' -f $services[0])
+}
+
+function Sync-RunnerEnv {
+    $current = Get-RunnerEnvPath
+    $known = @{}
+    foreach ($entry in $current -split ';') { if ($entry -ne '') { $known[(Get-PathKey $entry)] = $true } }
+    $missing = @([Environment]::GetEnvironmentVariable('Path', 'Machine') -split ';' | Where-Object { $_ -ne '' -and -not $known.ContainsKey((Get-PathKey $_)) })
+    if ($missing.Count -eq 0) { return }
+    Write-Log ('Machine PATH gained {0}; restarting the runner service to pick it up' -f ($missing -join ';'))
+    Write-RunnerEnv (Join-PathEntries (@($current -split ';') + $missing))
+    foreach ($name in Get-RunnerServiceNames) {
+        Stop-RunnerService $name
+        $null = Invoke-Capture (Join-Path $System32 'sc.exe') @('start', $name)
+        Wait-Until { (Get-ServiceState $name) -eq 'RUNNING' } 120 ('{0} to start' -f $name)
+    }
+}
+
+function Disable-RunnerServices {
+    foreach ($name in Get-RunnerServiceNames) {
+        Write-Log ('Disabling runner service {0} so it does not take jobs' -f $name)
+        $null = Invoke-Capture (Join-Path $System32 'sc.exe') @('stop', $name)
+        $null = Invoke-Capture (Join-Path $System32 'sc.exe') @('config', $name, 'start=', 'disabled')
+    }
+}
+
+try {
+    Write-Log ('Bootstrap starting: runner {0} for {1} on {2}' -f $RunnerVersion, $GithubRepo, $env:COMPUTERNAME)
+    if (Test-BootstrapCurrent) {
+        Write-Log 'Runner already registered, running and bootstrapped by this script; nothing to do'
+        exit 0
+    }
+    Remove-Item -Force -ErrorAction SilentlyContinue $ReadyFile, $FingerprintFile
+    Enable-LongPaths
+    Install-RunnerPackage
+    Write-JobHooks
+    Register-Runner
+    Install-Git
+    Install-Pwsh
+    if ($InstallGh) { Install-GhCli }
+    if ($InstallMsvc) { Install-MsvcBuildTools }
+    if ($InstallRustup) { Install-Rustup }
+    Invoke-ExtraBootstrap
+    Sync-RunnerEnv
+    Set-Content -Path $ReadyFile -Value (Get-Date -Format o) -Encoding ASCII
+    Set-Content -Path $FingerprintFile -Value (Get-Fingerprint) -Encoding ASCII
+    Write-Log 'Bootstrap finished; runner is ready for jobs'
+
+    if ($script:RebootRequired) {
+        if (Get-Process -Name 'Runner.Worker' -ErrorAction SilentlyContinue) {
+            Write-Log 'An installer requested a reboot, but a job is running; skipping it'
+        } else {
+            Write-Log 'An installer requested a reboot; restarting in 30 seconds (the runner service starts on boot)'
+            foreach ($name in Get-RunnerServiceNames) { Stop-RunnerService $name }
+            $null = Invoke-Capture (Join-Path $System32 'shutdown.exe') @('/r', '/t', '30', '/d', 'p:4:1', '/c', 'gh-runner bootstrap')
+        }
+    }
+    exit 0
+} catch {
+    Write-Log ('Bootstrap failed: {0}' -f $_.Exception.Message)
+    Write-Log $_.ScriptStackTrace
+    Remove-Item -Force -ErrorAction SilentlyContinue $ReadyFile
+    Disable-RunnerServices
+    exit 1
+}

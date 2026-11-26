@@ -3,6 +3,11 @@ output "resource_group_name" {
   value       = azurerm_resource_group.rg.name
 }
 
+output "resource_group_id" {
+  description = "Resource group ID"
+  value       = azurerm_resource_group.rg.id
+}
+
 output "location" {
   description = "Azure region"
   value       = azurerm_resource_group.rg.location
@@ -11,6 +16,68 @@ output "location" {
 output "vnet_name" {
   description = "Virtual network name"
   value       = azurerm_virtual_network.vnet.name
+}
+
+output "vnet_id" {
+  description = "Virtual network ID"
+  value       = azurerm_virtual_network.vnet.id
+}
+
+output "vnet_address_space" {
+  description = "Virtual network address space"
+  value       = azurerm_virtual_network.vnet.address_space
+}
+
+output "runners_subnet_id" {
+  description = "ID of the subnet hosting the Linux runner VMSS"
+  value       = azurerm_subnet.runners.id
+}
+
+output "runners_subnet_name" {
+  description = "Name of the subnet hosting the Linux runner VMSS"
+  value       = azurerm_subnet.runners.name
+}
+
+output "bastion_subnet_id" {
+  description = "AzureBastionSubnet ID"
+  value       = azurerm_subnet.bastion.id
+}
+
+output "bastion_subnet_address_prefix" {
+  description = "AzureBastionSubnet address prefix (source for SSH/RDP allow rules)"
+  value       = local.bastion_subnet_prefix
+}
+
+output "nsg_id" {
+  description = "ID of the NSG attached to the Linux runners subnet"
+  value       = azurerm_network_security_group.runners.id
+}
+
+output "nsg_name" {
+  description = "Name of the NSG attached to the Linux runners subnet"
+  value       = azurerm_network_security_group.runners.name
+}
+
+output "bastion_public_ip_id" {
+  description = "Bastion public IP resource ID"
+  value       = azurerm_public_ip.bastion.id
+}
+
+output "bastion_public_ip_address" {
+  description = "Bastion public IP address"
+  value       = azurerm_public_ip.bastion.ip_address
+}
+
+output "network" {
+  description = "Shared network handle for attaching another runner pool (e.g. modules/github-runner/azure-vmss-windows `network` input) to this resource group, VNet and Bastion."
+  value = {
+    resource_group_name           = azurerm_resource_group.rg.name
+    location                      = azurerm_resource_group.rg.location
+    virtual_network_name          = azurerm_virtual_network.vnet.name
+    bastion_subnet_address_prefix = local.bastion_subnet_prefix
+    bastion_name                  = azurerm_bastion_host.this.name
+  }
+  depends_on = [azurerm_subnet_network_security_group_association.runners]
 }
 
 output "vmss_name" {

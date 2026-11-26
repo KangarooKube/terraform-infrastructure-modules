@@ -21,25 +21,37 @@ resource "random_string" "suffix" {
 }
 
 locals {
-  name_suffix    = random_string.suffix.result
-  vnet_name      = "${var.name_prefix}-vnet"
-  runners_subnet = "snet-runners"
-  bastion_subnet = "AzureBastionSubnet"
-  nsg_name       = "${var.name_prefix}-nsg-runners"
-  bastion_name   = "${var.name_prefix}-bas"
-  bastion_pip    = "${var.name_prefix}-pip-bas"
-  vmss_name      = "${var.name_prefix}-vmss-runner"
+  name_suffix           = random_string.suffix.result
+  vnet_name             = "${var.name_prefix}-vnet"
+  runners_subnet        = "snet-runners"
+  bastion_subnet        = "AzureBastionSubnet"
+  bastion_subnet_prefix = "10.0.2.0/26"
+  nsg_name              = "${var.name_prefix}-nsg-runners"
+  bastion_name          = "${var.name_prefix}-bas"
+  bastion_pip           = "${var.name_prefix}-pip-bas"
+  vmss_name             = "${var.name_prefix}-vmss-runner"
 
   bootstrap_script = file("${path.module}/bootstrap-github-runner.sh")
 
   cloud_init_rendered = templatefile("${path.module}/cloud-init.yaml.tftpl", {
-    github_repo          = var.github_repo
-    github_runner_token  = var.github_runner_token
-    runner_labels        = join(",", var.runner_labels)
-    runner_version       = var.runner_version
-    runner_user          = var.admin_username
-    bootstrap_script_b64 = base64encode(local.bootstrap_script)
+    github_repo                = var.github_repo
+    github_runner_token        = var.github_runner_token
+    runner_labels              = join(",", var.runner_labels)
+    runner_version             = var.runner_version
+    runner_user                = var.admin_username
+    extra_apt_packages         = join(" ", var.extra_apt_packages)
+    job_cleanup_enabled        = var.job_cleanup_enabled
+    bootstrap_script_b64       = base64encode(local.bootstrap_script)
+    extra_bootstrap_script_b64 = var.extra_bootstrap_script == "" ? "" : base64encode(var.extra_bootstrap_script)
   })
+
+  # The `hybrid-vm-migration-publicip-mustbefirstpartytagged` policy denies
+  # public IPs without a FirstPartyUsage ipTag unless they carry both skip tags.
+  bastion_pip_first_party_tagged = contains(keys(var.bastion_public_ip_tags), "FirstPartyUsage")
+  bastion_pip_policy_skip_tags = local.bastion_pip_first_party_tagged ? {} : {
+    "hybrid-vm-migration-publicip-mustbefirstpartytagged-skip-flag"          = "true"
+    "hybrid-vm-migration-publicip-mustbefirstpartytagged-skip-justification" = "Azure Bastion ingress for self-hosted GitHub runner — runner VMSS itself has no public IP"
+  }
 }
 
 resource "azurerm_resource_group" "rg" {
@@ -67,7 +79,7 @@ resource "azurerm_subnet" "bastion" {
   name                 = local.bastion_subnet
   resource_group_name  = azurerm_resource_group.rg.name
   virtual_network_name = azurerm_virtual_network.vnet.name
-  address_prefixes     = ["10.0.2.0/26"]
+  address_prefixes     = [local.bastion_subnet_prefix]
 }
 
 resource "azurerm_network_security_group" "runners" {
@@ -84,7 +96,7 @@ resource "azurerm_network_security_group" "runners" {
     protocol                   = "Tcp"
     source_port_range          = "*"
     destination_port_range     = "22"
-    source_address_prefix      = "10.0.2.0/26"
+    source_address_prefix      = local.bastion_subnet_prefix
     destination_address_prefix = "*"
     description                = "SSH from AzureBastionSubnet only"
   }
@@ -139,14 +151,8 @@ resource "azurerm_public_ip" "bastion" {
   allocation_method   = "Static"
   sku                 = "Standard"
   domain_name_label   = "${var.name_prefix}-bas-${local.name_suffix}"
-
-  # Skip the `hybrid-vm-migration-publicip-mustbefirstpartytagged` policy.
-  # The policy denies PIPs without ipTags of FirstPartyUsage, but exempts
-  # resources tagged with both skip-flag and skip-justification.
-  tags = merge(var.tags, {
-    "hybrid-vm-migration-publicip-mustbefirstpartytagged-skip-flag"          = "true"
-    "hybrid-vm-migration-publicip-mustbefirstpartytagged-skip-justification" = "Azure Bastion ingress for self-hosted GitHub runner — runner VMSS itself has no public IP"
-  })
+  ip_tags             = var.bastion_public_ip_tags
+  tags                = merge(var.tags, local.bastion_pip_policy_skip_tags)
 }
 
 resource "azurerm_bastion_host" "this" {

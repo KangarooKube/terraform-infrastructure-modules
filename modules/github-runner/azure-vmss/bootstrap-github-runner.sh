@@ -12,8 +12,12 @@
 #   GH_RUNNER_TOKEN    — registration token (1-hour TTL)
 #   RUNNER_LABELS      — comma-separated custom labels (e.g. "gh-runner-azure")
 #   RUNNER_NAME        — runner name (defaults to gh-runner-runner-<hostname>)
-#   RUNNER_VERSION     — actions-runner release version (e.g. 2.331.0)
+#   RUNNER_VERSION     — actions-runner release version (e.g. 2.338.2)
 #   RUNNER_USER        — local user that owns and runs the runner (e.g. azureuser)
+#   EXTRA_APT_PACKAGES — optional space-separated apt packages
+#   JOB_CLEANUP_ENABLED — "true" installs the job-started/job-completed hooks
+#
+# Optional /opt/gh-runner/extra-bootstrap.sh runs as root before registration.
 #
 set -euo pipefail
 
@@ -35,15 +39,24 @@ set +a
 : "${GH_RUNNER_TOKEN:?GH_RUNNER_TOKEN not set}"
 RUNNER_LABELS="${RUNNER_LABELS:-gh-runner-azure}"
 RUNNER_NAME="${RUNNER_NAME:-$(hostname)}"
-RUNNER_VERSION="${RUNNER_VERSION:-2.331.0}"
+RUNNER_VERSION="${RUNNER_VERSION:-2.338.2}"
 RUNNER_USER="${RUNNER_USER:-azureuser}"
+EXTRA_APT_PACKAGES="${EXTRA_APT_PACKAGES:-}"
+JOB_CLEANUP_ENABLED="${JOB_CLEANUP_ENABLED:-true}"
 DOCKER_VERSION="${DOCKER_VERSION:-5:27.5.1-1~ubuntu.24.04~noble}"
 
 # ----- Base packages ---------------------------------------------------------
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 apt-get install -y --no-install-recommends \
-  ca-certificates curl gnupg lsb-release jq sudo tar
+  ca-certificates curl gnupg lsb-release jq sudo tar \
+  git git-lfs python3 python3-venv python3-pip openssl \
+  unzip zip wget rsync xz-utils zstd build-essential
+if [[ -n "$EXTRA_APT_PACKAGES" ]]; then
+  echo "Installing extra apt packages: $EXTRA_APT_PACKAGES"
+  # shellcheck disable=SC2086
+  apt-get install -y --no-install-recommends $EXTRA_APT_PACKAGES
+fi
 
 # ----- Docker (idempotent) ---------------------------------------------------
 if ! command -v docker >/dev/null 2>&1; then
@@ -89,8 +102,16 @@ else
 fi
 rm -f "$SUDOERS_TMP"
 
+EXTRA_SCRIPT="/opt/gh-runner/extra-bootstrap.sh"
+if [[ -s "$EXTRA_SCRIPT" ]]; then
+  echo "Running extra bootstrap script $EXTRA_SCRIPT..."
+  bash "$EXTRA_SCRIPT"
+fi
+
 # ----- GitHub Actions runner -------------------------------------------------
 RUNNER_HOME="/home/${RUNNER_USER}/actions-runner"
+RUNNER_WORK_DIR="${RUNNER_HOME}/_work"
+HOOK_DIR="/opt/gh-runner/hooks"
 RUNNER_TARBALL="actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz"
 RUNNER_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${RUNNER_TARBALL}"
 
@@ -126,6 +147,77 @@ sudo -u "$RUNNER_USER" -H bash -c "cd '$RUNNER_HOME' && ./config.sh \
   --labels '$RUNNER_LABELS' \
   --runnergroup default \
   --work _work"
+
+# Job hooks run as the runner user via `bash -e`; they log and always exit 0 so
+# a cleanup problem never fails a job.
+install -d -m 0755 -o root -g root "$HOOK_DIR"
+printf 'WORK_DIR=%q\n' "$RUNNER_WORK_DIR" > "$HOOK_DIR/common.sh"
+cat >> "$HOOK_DIR/common.sh" <<'EOF'
+log() { echo "[gh-runner-cleanup] $*" >&2; }
+
+# Prints the resolved job workspace, or fails if it is empty or not strictly
+# beneath the runner work directory.
+resolve_workspace() {
+  local ws="${GITHUB_WORKSPACE:-}" root real
+  if [[ -z "$ws" ]]; then
+    log "GITHUB_WORKSPACE is empty; skipping workspace cleanup"
+    return 1
+  fi
+  root="$(realpath -m -- "$WORK_DIR")"
+  if ! real="$(realpath -m -- "$ws")"; then
+    log "cannot resolve '$ws'; skipping workspace cleanup"
+    return 1
+  fi
+  if [[ -z "$root" || "$root" == "/" || "$real" != "$root"/?* ]]; then
+    log "refusing to clean '$real': not strictly beneath '$root'"
+    return 1
+  fi
+  printf '%s\n' "$real"
+}
+EOF
+cat > "$HOOK_DIR/job-started.sh" <<'EOF'
+#!/bin/bash
+set +e +o pipefail
+. /opt/gh-runner/hooks/common.sh
+if ws="$(resolve_workspace)" && [[ -d "$ws" ]]; then
+  sudo -n chown -R -h "$(id -u):$(id -g)" -- "$ws" || log "failed to take ownership of '$ws'"
+fi
+exit 0
+EOF
+cat > "$HOOK_DIR/job-completed.sh" <<'EOF'
+#!/bin/bash
+set +e +o pipefail
+. /opt/gh-runner/hooks/common.sh
+if command -v docker >/dev/null 2>&1; then
+  if ids="$(docker ps -aq)"; then
+    if [[ -n "$ids" ]]; then
+      # shellcheck disable=SC2086
+      docker rm -f $ids >/dev/null || log "docker rm -f failed"
+    fi
+  else
+    log "docker ps failed; skipping container cleanup"
+  fi
+  docker network prune -f >/dev/null || log "docker network prune failed"
+  docker volume prune -f >/dev/null || log "docker volume prune failed"
+fi
+if ws="$(resolve_workspace)" && [[ -d "$ws" ]]; then
+  sudo -n find "$ws" -mindepth 1 -delete || log "failed to fully clean '$ws'"
+fi
+exit 0
+EOF
+chmod 0644 "$HOOK_DIR/common.sh"
+chmod 0755 "$HOOK_DIR/job-started.sh" "$HOOK_DIR/job-completed.sh"
+
+# config.sh (re)writes .env; replace any prior hook lines.
+RUNNER_DOTENV="${RUNNER_HOME}/.env"
+touch "$RUNNER_DOTENV"
+sed -i '/^ACTIONS_RUNNER_HOOK_JOB_/d' "$RUNNER_DOTENV"
+if [[ "$JOB_CLEANUP_ENABLED" == "true" ]]; then
+  echo "Enabling job cleanup hooks"
+  printf 'ACTIONS_RUNNER_HOOK_JOB_STARTED=%s\nACTIONS_RUNNER_HOOK_JOB_COMPLETED=%s\n' \
+    "$HOOK_DIR/job-started.sh" "$HOOK_DIR/job-completed.sh" >> "$RUNNER_DOTENV"
+fi
+chown "$RUNNER_USER:$RUNNER_USER" "$RUNNER_DOTENV"
 
 echo "Installing runner as systemd service..."
 ( cd "$RUNNER_HOME" && ./svc.sh install "$RUNNER_USER" )

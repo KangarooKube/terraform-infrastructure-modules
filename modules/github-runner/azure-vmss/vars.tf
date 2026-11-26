@@ -40,8 +40,38 @@ variable "runner_labels" {
 
 variable "runner_version" {
   type        = string
-  description = "actions/runner release version installed by the bootstrap script (e.g. 2.331.0)"
-  default     = "2.331.0"
+  description = "actions/runner release version installed by the bootstrap script (e.g. 2.338.2)"
+  default     = "2.338.2"
+}
+
+variable "bastion_public_ip_tags" {
+  type        = map(string)
+  description = "ipTags (ipTagType => tag) on the Bastion public IP. ipTags are immutable in Azure, so changing this replaces the public IP and the Bastion host. Set to {} to omit ipTags; the module then adds the hybrid-vm-migration policy skip tags instead."
+  default = {
+    FirstPartyUsage = "/NonProd"
+  }
+}
+
+variable "extra_apt_packages" {
+  type        = list(string)
+  description = "Additional apt packages installed on every instance after the base toolchain (git, git-lfs, python3, python3-venv, python3-pip, openssl, build-essential, jq, curl, wget, unzip, zip, rsync, xz-utils, zstd)."
+  default     = []
+  validation {
+    condition     = alltrue([for p in var.extra_apt_packages : can(regex("^[a-z0-9][a-z0-9+.:=~-]*$", p))])
+    error_message = "extra_apt_packages entries must be plain apt package names (optionally pinned with =version)."
+  }
+}
+
+variable "extra_bootstrap_script" {
+  type        = string
+  description = "Optional bash script run as root on every instance after the base packages and Docker are installed and before the runner registers. A non-zero exit fails the bootstrap. It is delivered through custom_data, so it must not contain secrets."
+  default     = ""
+}
+
+variable "job_cleanup_enabled" {
+  type        = bool
+  description = "Install runner job hooks that reset the workspace between jobs: the job-started hook takes ownership of the job workspace (root-owned files left by containers), and the job-completed hook removes all Docker containers, prunes unused networks and anonymous volumes, and deletes the workspace contents. Cleanup only touches a workspace strictly beneath the runner work directory, and each instance hosts a single runner, so Docker-wide cleanup cannot affect another runner."
+  default     = true
 }
 
 variable "instance_count" {
